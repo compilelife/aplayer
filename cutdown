@@ -5,3 +5,4 @@ format options
 codec options
 config.h
 macro
+show_mode
