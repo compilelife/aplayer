@@ -1919,32 +1919,30 @@ static int audio_open(void *opaque, int64_t wanted_channel_layout, int wanted_nb
     return spec.size;
 }
 
-/* open a given stream. Return 0 if OK */
-static int stream_component_open(VideoState *is, int stream_index)
+static int open_decoder(AVCodec* codec, AVCodecContext* avctx)
 {
-    AVFormatContext *ic = is->ic;
-    AVCodecContext *avctx;
-    AVCodec *codec;
-    const char *forced_codec_name = NULL;
-    AVDictionaryEntry *t = NULL;
-    int sample_rate, nb_channels;
-    int64_t channel_layout;
-    int ret = 0;
-    int stream_lowres = lowres;
-
-    if (stream_index < 0 || stream_index >= ic->nb_streams)
-        return -1;
-
-    avctx = avcodec_alloc_context3(NULL);
-    if (!avctx)
-        return AVERROR(ENOMEM);
-
-    ret = avcodec_parameters_to_context(avctx, ic->streams[stream_index]->codecpar);
-    if (ret < 0)
-        goto fail;
     avctx->pkt_timebase = ic->streams[stream_index]->time_base;
+    avctx->codec_id = codec->id;
+    if (stream_lowres > codec->max_lowres) {
+        av_log(avctx, AV_LOG_WARNING, "The maximum value for lowres supported by the decoder is %d\n",
+                codec->max_lowres);
+        stream_lowres = codec->max_lowres;
+    }
+    avctx->lowres = stream_lowres;
 
-    codec = avcodec_find_decoder(avctx->codec_id);
+    if (fast)
+        avctx->flags2 |= AV_CODEC_FLAG2_FAST;
+
+    if ((ret = avcodec_open2(avctx, codec, NULL)) < 0) {
+        return ret;
+    }
+
+    return 0;
+}
+
+static int find_decoder(AVCodecContext* avctx, AVCodec** ret)
+{
+    AVCodec* codec = avcodec_find_decoder(avctx->codec_id);
 
     switch(avctx->codec_type){
         case AVMEDIA_TYPE_AUDIO   : is->last_audio_stream    = stream_index; forced_codec_name =    audio_codec_name; break;
@@ -1958,77 +1956,124 @@ static int stream_component_open(VideoState *is, int stream_index)
                                       "No codec could be found with name '%s'\n", forced_codec_name);
         else                   av_log(NULL, AV_LOG_WARNING,
                                       "No codec could be found with id %d\n", avctx->codec_id);
-        ret = AVERROR(EINVAL);
+        return AVERROR(EINVAL);
+    }
+
+    *ret = codec
+    return 0;
+}
+
+static int stream_component_open_audio(VideoState *is, AVCodecContext *avctx)
+{
+    int sample_rate, nb_channels;
+    int64_t channel_layout;
+    int ret = 0;
+
+    sample_rate    = avctx->sample_rate;
+    nb_channels    = avctx->channels;
+    channel_layout = avctx->channel_layout;
+
+    /* prepare audio output */
+    if ((ret = audio_open(is, channel_layout, nb_channels, sample_rate, &is->audio_tgt)) < 0){
+        avcodec_free_context(&avctx);
+        return ret;
+    }
+
+    is->audio_hw_buf_size = ret;
+    is->audio_src = is->audio_tgt;
+    is->audio_buf_size  = 0;
+    is->audio_buf_index = 0;
+
+    /* init averaging filter */
+    is->audio_diff_avg_coef  = exp(log(0.01) / AUDIO_DIFF_AVG_NB);
+    is->audio_diff_avg_count = 0;
+    /* since we do not have a precise anough audio FIFO fullness,
+       we correct audio sync only if larger than this threshold */
+    is->audio_diff_threshold = (double)(is->audio_hw_buf_size) / is->audio_tgt.bytes_per_sec;
+
+    is->audio_stream = stream_index;
+    is->audio_st = ic->streams[stream_index];
+
+    decoder_init(&is->auddec, avctx, &is->audioq, is->continue_read_thread);
+    if ((is->ic->iformat->flags & (AVFMT_NOBINSEARCH | AVFMT_NOGENSEARCH | AVFMT_NO_BYTE_SEEK)) && !is->ic->iformat->read_seek) {
+        is->auddec.start_pts = is->audio_st->start_time;
+        is->auddec.start_pts_tb = is->audio_st->time_base;
+    }
+    if ((ret = decoder_start(&is->auddec, audio_thread, is)) < 0)
+        return ret;
+    
+    SDL_PauseAudioDevice(audio_dev, 0);
+    return ret;
+}
+
+static int stream_component_open_video(VideoState *is, AVCodecContext *avctx)
+{
+    int ret = 0;
+
+    is->video_stream = stream_index;
+    is->video_st = ic->streams[stream_index];
+
+    decoder_init(&is->viddec, avctx, &is->videoq, is->continue_read_thread);
+    if ((ret = decoder_start(&is->viddec, video_thread, is)) < 0)
+        return ret;
+    is->queue_attachments_req = 1;
+
+    return ret;
+}
+
+static int stream_component_open_subtitle(VideoState *is, AVCodecContext *avctx)
+{
+    int ret = 0;
+
+    is->subtitle_stream = stream_index;
+    is->subtitle_st = ic->streams[stream_index];
+
+    decoder_init(&is->subdec, avctx, &is->subtitleq, is->continue_read_thread);
+    if ((ret = decoder_start(&is->subdec, subtitle_thread, is)) < 0)
+        return ret;
+
+    return ret;
+}
+
+/* open a given stream. Return 0 if OK */
+static int stream_component_open(VideoState *is, int stream_index)
+{
+    AVFormatContext *ic = is->ic;
+    AVCodecContext *avctx;
+    AVCodec *codec;
+    const char *forced_codec_name = NULL;
+    AVDictionaryEntry *t = NULL;
+    int ret = 0;
+    int stream_lowres = lowres;
+
+    if (stream_index < 0 || stream_index >= ic->nb_streams)
+        return -1;
+
+    avctx = avcodec_alloc_context3(NULL);
+    if (!avctx)
+        return AVERROR(ENOMEM);
+
+    ret = avcodec_parameters_to_context(avctx, ic->streams[stream_index]->codecpar);
+    if (ret < 0)
         goto fail;
-    }
 
-    avctx->codec_id = codec->id;
-    if (stream_lowres > codec->max_lowres) {
-        av_log(avctx, AV_LOG_WARNING, "The maximum value for lowres supported by the decoder is %d\n",
-                codec->max_lowres);
-        stream_lowres = codec->max_lowres;
-    }
-    avctx->lowres = stream_lowres;
-
-    if (fast)
-        avctx->flags2 |= AV_CODEC_FLAG2_FAST;
-
-    if ((ret = avcodec_open2(avctx, codec, NULL)) < 0) {
+    if ((ret = find_decoder(avctx, *codec)) != 0)
         goto fail;
-    }
+
+    if ((ret = open_decoder(codec, avctx)) != 0)
+        goto fail;
 
     is->eof = 0;
     ic->streams[stream_index]->discard = AVDISCARD_DEFAULT;
     switch (avctx->codec_type) {
     case AVMEDIA_TYPE_AUDIO:
-
-        sample_rate    = avctx->sample_rate;
-        nb_channels    = avctx->channels;
-        channel_layout = avctx->channel_layout;
-
-        /* prepare audio output */
-        if ((ret = audio_open(is, channel_layout, nb_channels, sample_rate, &is->audio_tgt)) < 0)
-            goto fail;
-        is->audio_hw_buf_size = ret;
-        is->audio_src = is->audio_tgt;
-        is->audio_buf_size  = 0;
-        is->audio_buf_index = 0;
-
-        /* init averaging filter */
-        is->audio_diff_avg_coef  = exp(log(0.01) / AUDIO_DIFF_AVG_NB);
-        is->audio_diff_avg_count = 0;
-        /* since we do not have a precise anough audio FIFO fullness,
-           we correct audio sync only if larger than this threshold */
-        is->audio_diff_threshold = (double)(is->audio_hw_buf_size) / is->audio_tgt.bytes_per_sec;
-
-        is->audio_stream = stream_index;
-        is->audio_st = ic->streams[stream_index];
-
-        decoder_init(&is->auddec, avctx, &is->audioq, is->continue_read_thread);
-        if ((is->ic->iformat->flags & (AVFMT_NOBINSEARCH | AVFMT_NOGENSEARCH | AVFMT_NO_BYTE_SEEK)) && !is->ic->iformat->read_seek) {
-            is->auddec.start_pts = is->audio_st->start_time;
-            is->auddec.start_pts_tb = is->audio_st->time_base;
-        }
-        if ((ret = decoder_start(&is->auddec, audio_thread, is)) < 0)
-            goto out;
-        SDL_PauseAudioDevice(audio_dev, 0);
+        ret = stream_component_open_audio(is, avctx);
         break;
     case AVMEDIA_TYPE_VIDEO:
-        is->video_stream = stream_index;
-        is->video_st = ic->streams[stream_index];
-
-        decoder_init(&is->viddec, avctx, &is->videoq, is->continue_read_thread);
-        if ((ret = decoder_start(&is->viddec, video_thread, is)) < 0)
-            goto out;
-        is->queue_attachments_req = 1;
+        ret = stream_component_open_video(is, avctx);
         break;
     case AVMEDIA_TYPE_SUBTITLE:
-        is->subtitle_stream = stream_index;
-        is->subtitle_st = ic->streams[stream_index];
-
-        decoder_init(&is->subdec, avctx, &is->subtitleq, is->continue_read_thread);
-        if ((ret = decoder_start(&is->subdec, subtitle_thread, is)) < 0)
-            goto out;
+        ret = stream_component_open_subtitle(is, avctx);
         break;
     default:
         break;
