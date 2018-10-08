@@ -511,13 +511,15 @@ static void decoder_init(Decoder *d, AVCodecContext *avctx, PacketQueue *queue, 
     d->pkt_serial = -1;
 }
 
+//参考：https://zhuanlan.zhihu.com/p/43948483
 static int decoder_decode_frame(Decoder *d, AVFrame *frame, AVSubtitle *sub) {
     int ret = AVERROR(EAGAIN);
 
+    //循环直到出错，或解出一帧，分3个主要步骤
     for (;;) {
         AVPacket pkt;
-//倒装的作用在于对一个Packet多个帧输出的，能先取走上次Packet的帧，而不造成累积
-        if (d->queue->serial == d->pkt_serial) {
+        //1. 流连续的情况下，不断调用avcodec_receive_frame获取解码后的frame
+        if (d->queue->serial == d->pkt_serial) {//serial相等，则decoder中的帧有效
             do {
                 if (d->queue->abort_request)
                     return -1;
@@ -558,10 +560,11 @@ static int decoder_decode_frame(Decoder *d, AVFrame *frame, AVSubtitle *sub) {
             } while (ret != AVERROR(EAGAIN));
         }
 
+        //2. 取一个packet，顺带过滤“过时”的packet
         do {
             if (d->queue->nb_packets == 0)
                 SDL_CondSignal(d->empty_queue_cond);
-            if (d->packet_pending) {//?packet_pending=1 pkt下次while到packet_queue_get内存泄漏？
+            if (d->packet_pending) {
                 av_packet_move_ref(&pkt, &d->pkt);
                 d->packet_pending = 0;
             } else {
@@ -570,25 +573,26 @@ static int decoder_decode_frame(Decoder *d, AVFrame *frame, AVSubtitle *sub) {
             }
         } while (d->queue->serial != d->pkt_serial);
 
-        if (pkt.data == flush_pkt.data) {
+        if (pkt.data == flush_pkt.data) {//flush_pkt处理：avcodec_flush_buffers
             avcodec_flush_buffers(d->avctx);
             d->finished = 0;
             d->next_pts = d->start_pts;
             d->next_pts_tb = d->start_pts_tb;
         } else {
-            if (d->avctx->codec_type == AVMEDIA_TYPE_SUBTITLE) {
+            if (d->avctx->codec_type == AVMEDIA_TYPE_SUBTITLE) {//subtitle的解码比较特别
                 int got_frame = 0;
                 ret = avcodec_decode_subtitle2(d->avctx, sub, &got_frame, &pkt);
                 if (ret < 0) {
                     ret = AVERROR(EAGAIN);
                 } else {
-                    if (got_frame && !pkt.data) {//参考注释，使用pkt.data = NULL && pkt.size = 0触发flush，这里判断如果有帧输出，且pkt.data==NULL，就一直flush(这就是个null_packet呀)
+                    if (got_frame && !pkt.data) {//参考avcodec_decode_subtitle2注释，使用pkt.data = NULL && pkt.size = 0触发flush，这里判断如果有帧输出，且pkt.data==NULL，就一直flush(这就是个null_packet呀)
                        d->packet_pending = 1;
                        av_packet_move_ref(&d->pkt, &pkt);
                     }
                     ret = got_frame ? 0 : (pkt.data ? AVERROR(EAGAIN) : AVERROR_EOF);
                 }
             } else {
+                //3. 将packet送入解码器
                 if (avcodec_send_packet(d->avctx, &pkt) == AVERROR(EAGAIN)) {
                     av_log(d->avctx, AV_LOG_ERROR, "Receive_frame and send_packet both returned EAGAIN, which is an API violation.\n");
                     d->packet_pending = 1;
@@ -1320,13 +1324,88 @@ static void update_video_pts(VideoState *is, double pts, int64_t pos, int serial
     sync_clock_to_slave(&is->extclk, &is->vidclk);
 }
 
+static void show_status_in_video_refresh(VideoState *is)
+{
+    static int64_t last_time;
+    int64_t cur_time;
+    int aqsize, vqsize, sqsize;
+    double av_diff;
+    cur_time = av_gettime_relative();
+
+    if (!last_time || (cur_time - last_time) >= 30000) {
+        aqsize = 0;
+        vqsize = 0;
+        sqsize = 0;
+        if (is->audio_st)
+            aqsize = is->audioq.size;
+        if (is->video_st)
+            vqsize = is->videoq.size;
+        if (is->subtitle_st)
+            sqsize = is->subtitleq.size;
+        av_diff = 0;
+        if (is->audio_st && is->video_st)
+            av_diff = get_clock(&is->audclk) - get_clock(&is->vidclk);
+        else if (is->video_st)
+            av_diff = get_master_clock(is) - get_clock(&is->vidclk);
+        else if (is->audio_st)
+            av_diff = get_master_clock(is) - get_clock(&is->audclk);
+        av_log(NULL, AV_LOG_INFO,
+               "%7.2f %s:%7.3f fd=%4d aq=%5dKB vq=%5dKB sq=%5dB f=%"PRId64"/%"PRId64"   \r",
+               get_master_clock(is),
+               (is->audio_st && is->video_st) ? "A-V" : (is->video_st ? "M-V" : (is->audio_st ? "M-A" : "   ")),
+               av_diff,
+               is->frame_drops_early + is->frame_drops_late,
+               aqsize / 1024,
+               vqsize / 1024,
+               sqsize,
+               is->video_st ? is->viddec.avctx->pts_correction_num_faulty_dts : 0,
+               is->video_st ? is->viddec.avctx->pts_correction_num_faulty_pts : 0);
+        fflush(stdout);
+        last_time = cur_time;
+    }
+}
+
+static void subtitle_refresh_hide_or_skip(VideoState *is)
+{
+    Frame *sp, *sp2;
+
+    while (frame_queue_nb_remaining(&is->subpq) > 0) {
+        sp = frame_queue_peek(&is->subpq);
+        if (frame_queue_nb_remaining(&is->subpq) > 1)
+            sp2 = frame_queue_peek_next(&is->subpq);
+        else
+            sp2 = NULL;
+
+        if (sp->serial != is->subtitleq.serial
+                || (is->vidclk.pts > (sp->pts + ((float) sp->sub.end_display_time / 1000)))
+                || (sp2 && is->vidclk.pts > (sp2->pts + ((float) sp2->sub.start_display_time / 1000))))
+        {
+            if (sp->uploaded) {
+                int i;
+                for (i = 0; i < sp->sub.num_rects; i++) {
+                    AVSubtitleRect *sub_rect = sp->sub.rects[i];
+                    uint8_t *pixels;
+                    int pitch, j;
+                    if (!SDL_LockTexture(is->sub_texture, (SDL_Rect *)sub_rect, (void **)&pixels, &pitch)) {
+                        for (j = 0; j < sub_rect->h; j++, pixels += pitch)
+                            memset(pixels, 0, sub_rect->w << 2);
+                        SDL_UnlockTexture(is->sub_texture);
+                    }
+                }
+            }
+            frame_queue_next(&is->subpq);
+        } else {
+            break;
+        }
+    }
+}
+
 /* called to display each frame */
+//参考：https://zhuanlan.zhihu.com/p/44122324
 static void video_refresh(void *opaque, double *remaining_time)
 {
     VideoState *is = opaque;
     double time;
-
-    Frame *sp, *sp2;
 
     if (!is->paused && get_master_sync_type(is) == AV_SYNC_EXTERNAL_CLOCK && is->realtime)
         check_external_clock_speed(is);
@@ -1384,37 +1463,7 @@ retry:
             }
 
             if (is->subtitle_st) {
-                    while (frame_queue_nb_remaining(&is->subpq) > 0) {
-                        sp = frame_queue_peek(&is->subpq);
-
-                        if (frame_queue_nb_remaining(&is->subpq) > 1)
-                            sp2 = frame_queue_peek_next(&is->subpq);
-                        else
-                            sp2 = NULL;
-
-                        if (sp->serial != is->subtitleq.serial
-                                || (is->vidclk.pts > (sp->pts + ((float) sp->sub.end_display_time / 1000)))
-                                || (sp2 && is->vidclk.pts > (sp2->pts + ((float) sp2->sub.start_display_time / 1000))))
-                        {
-                            if (sp->uploaded) {
-                                int i;
-                                for (i = 0; i < sp->sub.num_rects; i++) {
-                                    AVSubtitleRect *sub_rect = sp->sub.rects[i];
-                                    uint8_t *pixels;
-                                    int pitch, j;
-
-                                    if (!SDL_LockTexture(is->sub_texture, (SDL_Rect *)sub_rect, (void **)&pixels, &pitch)) {
-                                        for (j = 0; j < sub_rect->h; j++, pixels += pitch)
-                                            memset(pixels, 0, sub_rect->w << 2);
-                                        SDL_UnlockTexture(is->sub_texture);
-                                    }
-                                }
-                            }
-                            frame_queue_next(&is->subpq);
-                        } else {
-                            break;
-                        }
-                    }
+                subtitle_refresh_hide_or_skip(is);
             }
 
             frame_queue_next(&is->pictq);
@@ -1430,43 +1479,7 @@ display:
     }
     is->force_refresh = 0;
     if (show_status) {
-        static int64_t last_time;
-        int64_t cur_time;
-        int aqsize, vqsize, sqsize;
-        double av_diff;
-
-        cur_time = av_gettime_relative();
-        if (!last_time || (cur_time - last_time) >= 30000) {
-            aqsize = 0;
-            vqsize = 0;
-            sqsize = 0;
-            if (is->audio_st)
-                aqsize = is->audioq.size;
-            if (is->video_st)
-                vqsize = is->videoq.size;
-            if (is->subtitle_st)
-                sqsize = is->subtitleq.size;
-            av_diff = 0;
-            if (is->audio_st && is->video_st)
-                av_diff = get_clock(&is->audclk) - get_clock(&is->vidclk);
-            else if (is->video_st)
-                av_diff = get_master_clock(is) - get_clock(&is->vidclk);
-            else if (is->audio_st)
-                av_diff = get_master_clock(is) - get_clock(&is->audclk);
-            av_log(NULL, AV_LOG_INFO,
-                   "%7.2f %s:%7.3f fd=%4d aq=%5dKB vq=%5dKB sq=%5dB f=%"PRId64"/%"PRId64"   \r",
-                   get_master_clock(is),
-                   (is->audio_st && is->video_st) ? "A-V" : (is->video_st ? "M-V" : (is->audio_st ? "M-A" : "   ")),
-                   av_diff,
-                   is->frame_drops_early + is->frame_drops_late,
-                   aqsize / 1024,
-                   vqsize / 1024,
-                   sqsize,
-                   is->video_st ? is->viddec.avctx->pts_correction_num_faulty_dts : 0,
-                   is->video_st ? is->viddec.avctx->pts_correction_num_faulty_pts : 0);
-            fflush(stdout);
-            last_time = cur_time;
-        }
+        show_status_in_video_refresh(is);
     }
 }
 
@@ -1652,12 +1665,7 @@ static int subtitle_thread(void *arg)
 
 /* return the wanted number of samples to get better sync if sync_type is video
  * or external master clock */
-//1. 减少同步次数
-//2. 正确估算同步延迟
-//累计值：is->audio_diff_cum = diff + is->audio_diff_avg_coef * is->audio_diff_cum;
-//累计AV_NOSYNC_THRESHOLD次
-//计算均值：avg_diff = is->audio_diff_cum * (1.0 - is->audio_diff_avg_coef);
-//越靠后的diff权重越大
+//参考：https://zhuanlan.zhihu.com/p/44680734
 static int synchronize_audio(VideoState *is, int nb_samples)
 {
     int wanted_nb_samples = nb_samples;
@@ -2708,7 +2716,7 @@ static void event_loop(VideoState *cur_stream)
 
     for (;;) {
         double x;
-        refresh_loop_wait_event(cur_stream, &event);
+        refresh_loop_wait_event(cur_stream, &event);//这里显示画面
         switch (event.type) {
         case SDL_KEYDOWN:
             if (exit_on_keydown) {

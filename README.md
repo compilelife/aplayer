@@ -28,6 +28,7 @@ aplayer致力于将ffplay进行适当的裁剪和重构，以方便初学者快�
 - 重构main函数
 - 重构read_thread
 - 重构stream_component_open
+- 重构video_refresh
 
 # 计划中
 
