@@ -2176,11 +2176,14 @@ static int open_input_file(AVFormatContext **ctx, VideoState* is)
         window_title = av_asprintf("%s - %s", t->value, input_filename);
 
     is->realtime = is_realtime(ic);
+    *ctx = ic;
+    goto out;
 
 fail:
     if (ic && !is->ic)
         avformat_close_input(&ic);
 
+out:
     return ret;
 }
 
