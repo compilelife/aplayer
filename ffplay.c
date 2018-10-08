@@ -2125,7 +2125,7 @@ static int open_input_file(AVFormatContext **ctx, VideoState* is)
 {
     AVDictionaryEntry *t;
     AVFormatContext *ic = NULL;
-    int err, ret;
+    int err = 0, ret = 0;
 
     is->last_video_stream = is->video_stream = -1;
     is->last_audio_stream = is->audio_stream = -1;
@@ -2480,7 +2480,7 @@ static int read_thread(void *arg)
 {
     VideoState *is = arg;
     AVFormatContext *ic = NULL;
-    int ret;
+    int ret = 0;
     int st_index[AVMEDIA_TYPE_NB];
 
     if (open_input_file(&ic, is) != 0)
