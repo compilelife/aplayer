@@ -887,56 +887,66 @@ static int upload_texture(SDL_Texture **tex, AVFrame *frame, struct SwsContext *
     return ret;
 }
 
+static Frame* subtitle_refresh_render(VideoState *is, Frame *vp)
+{
+    Frame *sp = NULL;
+
+    if (frame_queue_nb_remaining(&is->subpq) > 0) {
+        sp = frame_queue_peek(&is->subpq);
+
+        if (vp->pts >= sp->pts + ((float) sp->sub.start_display_time / 1000)) {
+            if (!sp->uploaded) {
+                uint8_t* pixels[4];
+                int pitch[4];
+                int i;
+                if (!sp->width || !sp->height) {
+                    sp->width = vp->width;
+                    sp->height = vp->height;
+                }
+                if (realloc_texture(&is->sub_texture, SDL_PIXELFORMAT_ARGB8888, sp->width, sp->height, SDL_BLENDMODE_BLEND, 1) < 0)
+                    return;
+
+                for (i = 0; i < sp->sub.num_rects; i++) {
+                    AVSubtitleRect *sub_rect = sp->sub.rects[i];
+                    sub_rect->x = av_clip(sub_rect->x, 0, sp->width );
+                    sub_rect->y = av_clip(sub_rect->y, 0, sp->height);
+                    sub_rect->w = av_clip(sub_rect->w, 0, sp->width  - sub_rect->x);
+                    sub_rect->h = av_clip(sub_rect->h, 0, sp->height - sub_rect->y);
+
+                    is->sub_convert_ctx = sws_getCachedContext(is->sub_convert_ctx,
+                        sub_rect->w, sub_rect->h, AV_PIX_FMT_PAL8,
+                        sub_rect->w, sub_rect->h, AV_PIX_FMT_BGRA,
+                        0, NULL, NULL, NULL);
+
+                    if (!is->sub_convert_ctx) {
+                        av_log(NULL, AV_LOG_FATAL, "Cannot initialize the conversion context\n");
+                        return;
+                    }
+
+                    if (!SDL_LockTexture(is->sub_texture, (SDL_Rect *)sub_rect, (void **)pixels, pitch)) {
+                        sws_scale(is->sub_convert_ctx, (const uint8_t * const *)sub_rect->data, sub_rect->linesize,
+                                  0, sub_rect->h, pixels, pitch);
+                        SDL_UnlockTexture(is->sub_texture);
+                    }
+                }
+                sp->uploaded = 1;
+            }
+        } else
+            sp = NULL;
+    }
+
+    return sp;
+}
+
 static void video_image_display(VideoState *is)
 {
     Frame *vp;
-    Frame *sp = NULL;
+    Frame *sp;
     SDL_Rect rect;
 
     vp = frame_queue_peek_last(&is->pictq);
     if (is->subtitle_st) {
-        if (frame_queue_nb_remaining(&is->subpq) > 0) {
-            sp = frame_queue_peek(&is->subpq);
-
-            if (vp->pts >= sp->pts + ((float) sp->sub.start_display_time / 1000)) {
-                if (!sp->uploaded) {
-                    uint8_t* pixels[4];
-                    int pitch[4];
-                    int i;
-                    if (!sp->width || !sp->height) {
-                        sp->width = vp->width;
-                        sp->height = vp->height;
-                    }
-                    if (realloc_texture(&is->sub_texture, SDL_PIXELFORMAT_ARGB8888, sp->width, sp->height, SDL_BLENDMODE_BLEND, 1) < 0)
-                        return;
-
-                    for (i = 0; i < sp->sub.num_rects; i++) {
-                        AVSubtitleRect *sub_rect = sp->sub.rects[i];
-
-                        sub_rect->x = av_clip(sub_rect->x, 0, sp->width );
-                        sub_rect->y = av_clip(sub_rect->y, 0, sp->height);
-                        sub_rect->w = av_clip(sub_rect->w, 0, sp->width  - sub_rect->x);
-                        sub_rect->h = av_clip(sub_rect->h, 0, sp->height - sub_rect->y);
-
-                        is->sub_convert_ctx = sws_getCachedContext(is->sub_convert_ctx,
-                            sub_rect->w, sub_rect->h, AV_PIX_FMT_PAL8,
-                            sub_rect->w, sub_rect->h, AV_PIX_FMT_BGRA,
-                            0, NULL, NULL, NULL);
-                        if (!is->sub_convert_ctx) {
-                            av_log(NULL, AV_LOG_FATAL, "Cannot initialize the conversion context\n");
-                            return;
-                        }
-                        if (!SDL_LockTexture(is->sub_texture, (SDL_Rect *)sub_rect, (void **)pixels, pitch)) {
-                            sws_scale(is->sub_convert_ctx, (const uint8_t * const *)sub_rect->data, sub_rect->linesize,
-                                      0, sub_rect->h, pixels, pitch);
-                            SDL_UnlockTexture(is->sub_texture);
-                        }
-                    }
-                    sp->uploaded = 1;
-                }
-            } else
-                sp = NULL;
-        }
+        sp = subtitle_refresh_show(is, vp);
     }
 
     calculate_display_rect(&rect, is->xleft, is->ytop, is->width, is->height, vp->width, vp->height, vp->sar);
