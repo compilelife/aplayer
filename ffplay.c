@@ -1919,8 +1919,12 @@ static int audio_open(void *opaque, int64_t wanted_channel_layout, int wanted_nb
     return spec.size;
 }
 
-static int open_decoder(AVCodec* codec, AVCodecContext* avctx)
+static int open_decoder(VideoState* is, AVCodec* codec, AVCodecContext* avctx, int stream_index)
 {
+    AVFormatContext *ic = is->ic;
+    int stream_lowres = lowres;
+    int ret = 0;
+
     avctx->pkt_timebase = ic->streams[stream_index]->time_base;
     avctx->codec_id = codec->id;
     if (stream_lowres > codec->max_lowres) {
@@ -1940,9 +1944,10 @@ static int open_decoder(AVCodec* codec, AVCodecContext* avctx)
     return 0;
 }
 
-static int find_decoder(AVCodecContext* avctx, AVCodec** ret)
+static int find_decoder(VideoState* is, AVCodecContext* avctx, int stream_index, AVCodec** ret)
 {
     AVCodec* codec = avcodec_find_decoder(avctx->codec_id);
+    const char *forced_codec_name = NULL;
 
     switch(avctx->codec_type){
         case AVMEDIA_TYPE_AUDIO   : is->last_audio_stream    = stream_index; forced_codec_name =    audio_codec_name; break;
@@ -1959,12 +1964,13 @@ static int find_decoder(AVCodecContext* avctx, AVCodec** ret)
         return AVERROR(EINVAL);
     }
 
-    *ret = codec
+    *ret = codec;
     return 0;
 }
 
-static int stream_component_open_audio(VideoState *is, AVCodecContext *avctx)
+static int stream_component_open_audio(VideoState *is, AVCodecContext *avctx, int stream_index)
 {
+    AVFormatContext *ic = is->ic;
     int sample_rate, nb_channels;
     int64_t channel_layout;
     int ret = 0;
@@ -2006,8 +2012,9 @@ static int stream_component_open_audio(VideoState *is, AVCodecContext *avctx)
     return ret;
 }
 
-static int stream_component_open_video(VideoState *is, AVCodecContext *avctx)
+static int stream_component_open_video(VideoState *is, AVCodecContext *avctx, int stream_index)
 {
+    AVFormatContext *ic = is->ic;
     int ret = 0;
 
     is->video_stream = stream_index;
@@ -2021,8 +2028,9 @@ static int stream_component_open_video(VideoState *is, AVCodecContext *avctx)
     return ret;
 }
 
-static int stream_component_open_subtitle(VideoState *is, AVCodecContext *avctx)
+static int stream_component_open_subtitle(VideoState *is, AVCodecContext *avctx, int stream_index)
 {
+    AVFormatContext *ic = is->ic;
     int ret = 0;
 
     is->subtitle_stream = stream_index;
@@ -2041,10 +2049,8 @@ static int stream_component_open(VideoState *is, int stream_index)
     AVFormatContext *ic = is->ic;
     AVCodecContext *avctx;
     AVCodec *codec;
-    const char *forced_codec_name = NULL;
     AVDictionaryEntry *t = NULL;
     int ret = 0;
-    int stream_lowres = lowres;
 
     if (stream_index < 0 || stream_index >= ic->nb_streams)
         return -1;
@@ -2057,23 +2063,23 @@ static int stream_component_open(VideoState *is, int stream_index)
     if (ret < 0)
         goto fail;
 
-    if ((ret = find_decoder(avctx, *codec)) != 0)
+    if ((ret = find_decoder(is, avctx, stream_index, &codec)) != 0)
         goto fail;
 
-    if ((ret = open_decoder(codec, avctx)) != 0)
+    if ((ret = open_decoder(is, codec, avctx, stream_index)) != 0)
         goto fail;
 
     is->eof = 0;
     ic->streams[stream_index]->discard = AVDISCARD_DEFAULT;
     switch (avctx->codec_type) {
     case AVMEDIA_TYPE_AUDIO:
-        ret = stream_component_open_audio(is, avctx);
+        ret = stream_component_open_audio(is, avctx, stream_index);
         break;
     case AVMEDIA_TYPE_VIDEO:
-        ret = stream_component_open_video(is, avctx);
+        ret = stream_component_open_video(is, avctx, stream_index);
         break;
     case AVMEDIA_TYPE_SUBTITLE:
-        ret = stream_component_open_subtitle(is, avctx);
+        ret = stream_component_open_subtitle(is, avctx, stream_index);
         break;
     default:
         break;
@@ -2200,7 +2206,11 @@ static void seek_to_start_time(AVFormatContext *ic, VideoState* is)
 
 static void find_best_streams(AVFormatContext *ic, int st_index[AVMEDIA_TYPE_NB])
 {
-    memset(st_index, -1, sizeof(st_index));
+    
+    for(int i = 0; i < AVMEDIA_TYPE_NB; i++)
+    {
+        st_index[i] = -1;
+    }
 
     st_index[AVMEDIA_TYPE_VIDEO] =
         av_find_best_stream(ic, AVMEDIA_TYPE_VIDEO,
@@ -2413,7 +2423,7 @@ static int read_thread_loop(AVFormatContext *ic, VideoState* is)
         READ_THREAD_LOOP_CALL(read_thread_loop_handle_seek(ic, is));
         READ_THREAD_LOOP_CALL(read_thread_loop_handle_queue_attachments_req(ic, is));
         READ_THREAD_LOOP_CALL(read_thread_loop_handle_queue_full(is, wait_mutex));
-        READ_THREAD_LOOP_CALL(read_thread_loop_handle_loop(wait_mutex));
+        READ_THREAD_LOOP_CALL(read_thread_loop_handle_loop(is));
 
         //READ_THREAD_LOOP_CALL(read_thread_loop_handle_read());
         ret = av_read_frame(ic, pkt);
