@@ -904,7 +904,7 @@ static Frame* subtitle_refresh_render(VideoState *is, Frame *vp)
                     sp->height = vp->height;
                 }
                 if (realloc_texture(&is->sub_texture, SDL_PIXELFORMAT_ARGB8888, sp->width, sp->height, SDL_BLENDMODE_BLEND, 1) < 0)
-                    return;
+                    return NULL;
 
                 for (i = 0; i < sp->sub.num_rects; i++) {
                     AVSubtitleRect *sub_rect = sp->sub.rects[i];
@@ -920,7 +920,7 @@ static Frame* subtitle_refresh_render(VideoState *is, Frame *vp)
 
                     if (!is->sub_convert_ctx) {
                         av_log(NULL, AV_LOG_FATAL, "Cannot initialize the conversion context\n");
-                        return;
+                        return NULL;
                     }
 
                     if (!SDL_LockTexture(is->sub_texture, (SDL_Rect *)sub_rect, (void **)pixels, pitch)) {
@@ -946,7 +946,7 @@ static void video_image_display(VideoState *is)
 
     vp = frame_queue_peek_last(&is->pictq);
     if (is->subtitle_st) {
-        sp = subtitle_refresh_show(is, vp);
+        sp = subtitle_refresh_render(is, vp);
     }
 
     calculate_display_rect(&rect, is->xleft, is->ytop, is->width, is->height, vp->width, vp->height, vp->sar);
